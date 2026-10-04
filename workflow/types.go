@@ -86,15 +86,20 @@ type dag struct {
 
 // TaskState 是单个任务实例的持久化状态。
 type TaskState struct {
-	WorkflowName  string
-	RunID         string
-	TaskName      string
-	Status        TaskStatus
-	Attempt       int // 已发起的尝试序号（从 0 开始，首个在飞尝试为 1）
+	WorkflowName string
+	RunID        string
+	TaskName     string
+	Status       TaskStatus
+	Attempt      int // 已发起的尝试序号（从 0 开始，首个在飞尝试为 1）
+	// Owner 为发起当前（或最后一次）尝试的进程标识，用于恢复时归因中断尝试。
+	Owner         string
 	LastError     string
 	LastStartedAt *time.Time
 	LastEndedAt   *time.Time
 	UpdatedAt     time.Time
+	// Attempts 为已结算尝试的只增序列（含跳过与中断判定），
+	// 构成该任务的结果视图；旧版本状态数据无此字段，按空序列处理。
+	Attempts []AttemptRecord
 }
 
 // RunState 是一次工作流运行的持久化状态。
@@ -105,6 +110,12 @@ type RunState struct {
 	Tasks        map[string]*TaskState
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
+	// Lease 为当前执行租约；nil 表示无人持有（可获取）。
+	// 旧版本状态数据无此字段，按 nil 处理，天然兼容。
+	Lease *LeaseInfo
+	// LastToken 为已签发过的最大 fencing token，只增不减，
+	// 即使租约被释放也不复用，保证迟到写入永远可被识别。
+	LastToken int64
 }
 
 // AttemptResult 是任务执行函数返回的单次尝试结果。

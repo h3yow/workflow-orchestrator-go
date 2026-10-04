@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 // FileStore 将每次运行以一个 JSON 文件落盘，配合 flock 互斥锁，
@@ -128,31 +129,105 @@ func (s *FileStore) GetRun(ctx context.Context, runID string) (*RunState, error)
 	return snapshotRun(r), nil
 }
 
-// PutTask 持久化单个任务实例。
-func (s *FileStore) PutTask(ctx context.Context, runID string, task *TaskState) error {
+// PutTask 以 fencing token 条件写入单个任务实例。
+func (s *FileStore) PutTask(ctx context.Context, runID string, task *TaskState, token int64) (bool, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return false, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	l, err := s.lock()
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer l.unlock()
 	r, err := s.readLocked(runID)
 	if err != nil {
-		return err
+		return false, err
+	}
+	if !fenced(r, token) {
+		return false, nil
 	}
 	cp := snapshotTask(task)
 	cp.UpdatedAt = timeNow()
 	r.Tasks[task.TaskName] = cp
 	r.UpdatedAt = timeNow()
-	return s.writeLocked(r)
+	return true, s.writeLocked(r)
 }
 
-// PutRunStatus 持久化运行聚合状态。
-func (s *FileStore) PutRunStatus(ctx context.Context, runID string, status RunStatus) error {
+// PutRunStatus 以 fencing token 条件写入运行聚合状态。
+func (s *FileStore) PutRunStatus(ctx context.Context, runID string, status RunStatus, token int64) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	l, err := s.lock()
+	if err != nil {
+		return false, err
+	}
+	defer l.unlock()
+	r, err := s.readLocked(runID)
+	if err != nil {
+		return false, err
+	}
+	if !fenced(r, token) {
+		return false, nil
+	}
+	r.Status = status
+	r.UpdatedAt = timeNow()
+	return true, s.writeLocked(r)
+}
+
+// AcquireRunLease 原子地获取或重入续期运行租约（目录锁内读-改-写）。
+func (s *FileStore) AcquireRunLease(ctx context.Context, runID, owner string, ttl time.Duration) (bool, *RunState, error) {
+	if err := ctx.Err(); err != nil {
+		return false, nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	l, err := s.lock()
+	if err != nil {
+		return false, nil, err
+	}
+	defer l.unlock()
+	r, err := s.readLocked(runID)
+	if err != nil {
+		return false, nil, err
+	}
+	if !acquireLease(r, owner, ttl, timeNow()) {
+		return false, snapshotRun(r), nil
+	}
+	if err := s.writeLocked(r); err != nil {
+		return false, nil, err
+	}
+	return true, snapshotRun(r), nil
+}
+
+// RenewRunLease 在 owner+token 匹配时延长租约。
+func (s *FileStore) RenewRunLease(ctx context.Context, runID, owner string, token int64, ttl time.Duration) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	l, err := s.lock()
+	if err != nil {
+		return false, err
+	}
+	defer l.unlock()
+	r, err := s.readLocked(runID)
+	if err != nil {
+		return false, err
+	}
+	if !renewLease(r, owner, token, ttl, timeNow()) {
+		return false, nil
+	}
+	return true, s.writeLocked(r)
+}
+
+// ReleaseRunLease 在 owner+token 匹配时释放租约；失配为 no-op。
+func (s *FileStore) ReleaseRunLease(ctx context.Context, runID, owner string, token int64) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -167,8 +242,7 @@ func (s *FileStore) PutRunStatus(ctx context.Context, runID string, status RunSt
 	if err != nil {
 		return err
 	}
-	r.Status = status
-	r.UpdatedAt = timeNow()
+	releaseLease(r, owner, token, timeNow())
 	return s.writeLocked(r)
 }
 

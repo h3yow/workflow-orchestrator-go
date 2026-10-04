@@ -38,6 +38,7 @@ type runLoop struct {
 	engine *Engine
 	d      *dag
 	runID  string
+	claim  RunClaim // 跨进程归属权；为 nil 表示 Store 不支持认领（纯进程内）
 
 	state    map[string]*TaskState // 权威任务状态（每次迁移同步持久化）
 	inflight map[string]*inFlight
@@ -50,39 +51,96 @@ type runLoop struct {
 	done   chan struct{}
 }
 
-// ensureScheduled 保证同一 runID 只有一个调度循环（并发触发下唯一归属）。
+// ensureScheduled 保证同一 runID 只有一个调度循环。
+// 进程内由 active 表去重；跨进程由 Store 的归属认领（ClaimStore）保证：
+// 任一时刻同一 runID 至多一个进程持有归属权并真正调度，
+// 其他进程得到 nil 循环（只读等待终态）。
 func (e *Engine) ensureScheduled(d *dag, snap *RunState) (*runLoop, error) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if loop, ok := e.active[snap.RunID]; ok {
+		e.mu.Unlock()
 		return loop, nil
 	}
 	select {
 	case <-e.stopped:
+		e.mu.Unlock()
 		return nil, fmt.Errorf("engine is closed")
 	default:
 	}
 	if snap.Status != RunRunning {
+		e.mu.Unlock()
 		return nil, nil
+	}
+	e.mu.Unlock()
+
+	// 跨进程归属认领（锁外执行，避免阻塞引擎内其他运行）。
+	var claim RunClaim
+	if cs, ok := e.store.(ClaimStore); ok {
+		c, err := cs.TryClaimRun(context.Background(), snap.RunID, e.ownerID)
+		if err != nil {
+			return nil, err
+		}
+		if c == nil {
+			e.logger.LogDecision(Decision{At: e.nowFunc(), RunID: snap.RunID, Kind: DecisionClaimDenied,
+				Detail: "归属权被其他进程持有，本进程只读不调度"})
+			return nil, nil
+		}
+		claim = c
+	}
+
+	// 认领成功后回读最新状态：认领窗口内上一任持有者可能已把运行收尾。
+	fresh, err := e.store.GetRun(context.Background(), snap.RunID)
+	if err != nil {
+		releaseClaim(claim)
+		return nil, err
+	}
+	if fresh.Status != RunRunning {
+		releaseClaim(claim)
+		return nil, nil
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if loop, ok := e.active[snap.RunID]; ok {
+		// 并发窗口：本进程已有调度循环，释放多余认领。
+		releaseClaim(claim)
+		return loop, nil
+	}
+	select {
+	case <-e.stopped:
+		releaseClaim(claim)
+		return nil, fmt.Errorf("engine is closed")
+	default:
 	}
 	loop := &runLoop{
 		engine:        e,
 		d:             d,
 		runID:         snap.RunID,
-		state:         make(map[string]*TaskState, len(snap.Tasks)),
+		claim:         claim,
+		state:         make(map[string]*TaskState, len(fresh.Tasks)),
 		inflight:      make(map[string]*inFlight),
 		retryTimers:   make(map[string]*time.Timer),
 		blockedLogged: make(map[string]bool),
 		events:        make(chan event, 1024),
 		done:          make(chan struct{}),
 	}
-	for k, t := range snap.Tasks {
+	for k, t := range fresh.Tasks {
 		loop.state[k] = snapshotTask(t)
 	}
 	e.active[snap.RunID] = loop
 	e.wg.Add(1)
+	if claim != nil {
+		e.logger.LogDecision(Decision{At: e.nowFunc(), RunID: snap.RunID, Kind: DecisionClaimAcquired,
+			Detail: fmt.Sprintf("owner=%s 认领调度归属权", e.ownerID)})
+	}
 	go loop.run()
 	return loop, nil
+}
+
+func releaseClaim(c RunClaim) {
+	if c != nil {
+		_ = c.Release()
+	}
 }
 
 func (l *runLoop) log(kind, task string, attempt int, detail string) {
@@ -124,6 +182,11 @@ func (l *runLoop) unregister() {
 	l.engine.mu.Lock()
 	delete(l.engine.active, l.runID)
 	l.engine.mu.Unlock()
+	if l.claim != nil {
+		if err := l.claim.Release(); err != nil {
+			l.engine.logger.Logf("release claim of run %s: %v", l.runID, err)
+		}
+	}
 }
 
 // sendEvent 在引擎关闭时放弃投递，避免计时器 goroutine 泄漏。
@@ -178,9 +241,26 @@ func (l *runLoop) handleEvent(ev event) {
 	}
 }
 
+// appendRecord 追加一条尝试记录（结果 + 判定依据），随后由 persist 一并落盘。
+// 记录是结果视图的唯一事实来源：每次尝试有且仅有一条记录。
+func (l *runLoop) appendRecord(t *TaskState, outcome AttemptOutcome, reason string, ended time.Time) {
+	rec := AttemptRecord{
+		Attempt: t.Attempt,
+		Outcome: outcome,
+		Reason:  reason,
+		EndedAt: ended,
+	}
+	if t.LastStartedAt != nil {
+		v := *t.LastStartedAt
+		rec.StartedAt = &v
+	}
+	t.Records = append(t.Records, rec)
+}
+
 // recoverInterrupted 从既有状态恢复：
 //   - RUNNING 的任务是上次中断时未记录结果的尝试，绝不判定为成功，
-//     重新置为 READY 等待重新调度（Attempt 保留，该尝试计入已发起序号）；
+//     重新置为 READY 等待重新调度（Attempt 保留，该尝试计入已发起序号，
+//     并补记一条 INTERRUPTED 记录说明去向）；
 //   - FAILED/TIMED_OUT 表示崩溃发生在退避窗口，重新置为 READY；
 //   - 已成功/永久失败/跳过的终态原样保留。
 func (l *runLoop) recoverInterrupted() {
@@ -192,6 +272,8 @@ func (l *runLoop) recoverInterrupted() {
 			// 中断时在飞的尝试已经发起，Attempt 已自增，计入尝试次数。
 			l.log(DecisionRecoverRunning, name, t.Attempt,
 				"检测到中断时仍在执行的尝试，未记录结果，不判定为成功，重置为 READY 重新调度")
+			l.appendRecord(t, OutcomeInterrupted,
+				"持有进程中断，本次尝试结果未知，不计成功", l.engine.nowFunc())
 			if t.Attempt >= maxAttempts(def) {
 				t.Status = StatusPermanentlyFailed
 				t.LastError = "interrupted after exhausting attempt budget"
@@ -228,6 +310,9 @@ func (l *runLoop) propagateSkips() {
 			case StatusPermanentlyFailed, StatusSkipped:
 				t.Status = StatusSkipped
 				t.LastError = fmt.Sprintf("upstream task %q did not succeed", dep)
+				l.appendRecord(t, OutcomeSkipped,
+					fmt.Sprintf("上游 %s 状态=%s，未执行直接跳过", dep, l.state[dep].Status),
+					l.engine.nowFunc())
 				l.persist(t)
 				l.log(DecisionSkip, name, t.Attempt,
 					fmt.Sprintf("上游 %s 状态=%s，下游不执行直接跳过", dep, l.state[dep].Status))
@@ -352,18 +437,23 @@ func (l *runLoop) settle(name string, attempt int, res AttemptResult, timedOut b
 	case timedOut:
 		t.LastError = fmt.Sprintf("attempt %d timed out after %s", attempt, def.Timeout)
 		t.Status = StatusTimedOut
+		l.appendRecord(t, OutcomeTimedOut,
+			fmt.Sprintf("超过单次尝试超时 %s，超时计时器先于执行返回", def.Timeout), ended)
 		l.persist(t)
 		l.log(DecisionAttemptTimeout, name, attempt,
 			fmt.Sprintf("第 %d 次尝试超过 %s 收尾；结果依据：超时计时器先于执行返回", attempt, def.Timeout))
 	case res.Err != nil:
 		t.LastError = res.Err.Error()
 		t.Status = StatusFailed
+		l.appendRecord(t, OutcomeFailed,
+			fmt.Sprintf("执行函数返回 error=%v", res.Err), ended)
 		l.persist(t)
 		l.log(DecisionAttemptFailed, name, attempt,
 			fmt.Sprintf("第 %d 次尝试失败；结果依据：执行函数返回 error=%v", attempt, res.Err))
 	default:
 		t.Status = StatusSucceeded
 		t.LastError = ""
+		l.appendRecord(t, OutcomeSucceeded, "执行函数成功返回", ended)
 		l.persist(t)
 		l.log(DecisionAttemptSucceed, name, attempt, "尝试成功；终态=SUCCEEDED")
 		return

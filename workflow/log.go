@@ -22,6 +22,8 @@ const (
 	DecisionSkip             = "SKIP"              // 上游非成功终态，下游跳过
 	DecisionRunSucceeded     = "RUN_SUCCEEDED"
 	DecisionRunFailed        = "RUN_FAILED"
+	DecisionClaimAcquired    = "CLAIM_ACQUIRED" // 本进程认领运行的调度归属权
+	DecisionClaimDenied      = "CLAIM_DENIED"   // 归属权被其他进程持有，本进程只读不调度
 )
 
 // nopLogger 丢弃所有日志。

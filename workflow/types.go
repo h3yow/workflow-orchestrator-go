@@ -84,6 +84,26 @@ type dag struct {
 	order []string
 }
 
+// AttemptOutcome 是一次尝试（或跳过判定）的收尾方式。
+type AttemptOutcome string
+
+const (
+	OutcomeSucceeded   AttemptOutcome = "SUCCEEDED"   // 执行函数成功返回
+	OutcomeFailed      AttemptOutcome = "FAILED"      // 执行函数返回 error
+	OutcomeTimedOut    AttemptOutcome = "TIMED_OUT"   // 超时计时器先于执行返回
+	OutcomeInterrupted AttemptOutcome = "INTERRUPTED" // 持有进程中断，结果未知，未判定成功
+	OutcomeSkipped     AttemptOutcome = "SKIPPED"     // 上游非成功终态，未执行直接跳过
+)
+
+// AttemptRecord 记录一次尝试的结果与判定依据；跳过判定以 Attempt=0 记录。
+type AttemptRecord struct {
+	Attempt   int
+	Outcome   AttemptOutcome
+	Reason    string
+	StartedAt *time.Time
+	EndedAt   time.Time
+}
+
 // TaskState 是单个任务实例的持久化状态。
 type TaskState struct {
 	WorkflowName  string
@@ -95,6 +115,9 @@ type TaskState struct {
 	LastStartedAt *time.Time
 	LastEndedAt   *time.Time
 	UpdatedAt     time.Time
+	// Records 按时间顺序记录每次尝试的收尾与依据（含被中断与跳过），
+	// 是结果视图的唯一事实来源；旧版本状态文件无此字段时按空切片处理。
+	Records []AttemptRecord
 }
 
 // RunState 是一次工作流运行的持久化状态。

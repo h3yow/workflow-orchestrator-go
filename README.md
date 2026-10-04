@@ -1,14 +1,17 @@
 # DAG 工作流编排引擎（本地可运行）
 
 一个纯本地状态模拟的 DAG 工作流编排引擎：加载与校验工作流定义，按依赖推进任务，
-处理任务级重试与超时，支持同一工作流的并发触发与进程中断后的状态恢复。
-核心目标是：**在并发触发与重启恢复下，调度结果可解释、可复现**。
+处理任务级重试与超时，支持同一工作流的并发触发、**多进程（多 worker）共用同一状态目录
+的归属协调**与进程中断后的状态恢复。
+核心目标是：**在并发触发、多进程竞争与重启恢复下，调度结果可解释、可复现**。
 
-- 纯 Go 标准库，无外部依赖。
+- 纯 Go 标准库，无外部依赖、无外部服务/中间件；跨进程协调只靠文件系统与内核文件锁。
 - 每次运行由**单个串行调度 goroutine** 驱动，所有状态迁移只在该 goroutine 内发生；
   任务执行在独立 goroutine 中，但结果通过事件队列回到调度循环结算。
 - 每次尝试带**代际（attempt 序号）校验**：过期结果（超时先收尾后迟到的返回、
   被中断的尝试）一律丢弃，保证同一次尝试只产生一次状态写入。
+- 跨进程归属靠 **per-run 文件锁（flock）**：任一进程被强杀，内核自动释放锁，
+  其他 worker 在下一个巡检周期内接手。
 - 状态持久化抽象为 `Store` 接口，提供内存实现与 JSON 文件实现（`flock` 跨进程互斥）。
 
 ## 快速开始
@@ -22,13 +25,15 @@ go test ./... -race -v   # 全量测试（竞态检测 + 决策日志）
 
 | 文件 | 职责 |
 | --- | --- |
-| `workflow/types.go` | 任务/运行状态、策略、执行函数、决策日志等类型定义 |
+| `workflow/types.go` | 任务/运行状态、策略、尝试记录、执行函数、决策日志等类型定义 |
 | `workflow/validate.go` | 工作流加载与校验（重复任务/缺失依赖/成环） |
-| `workflow/engine.go` | 引擎入口：注册、触发（去重）、等待、关闭 |
-| `workflow/scheduler.go` | 串行调度循环：依赖推进、跳过传播、重试退避、超时结算、中断恢复 |
+| `workflow/engine.go` | 引擎入口：注册、触发（去重）、归属巡检、等待、关闭 |
+| `workflow/scheduler.go` | 串行调度循环：认领归属、依赖推进、跳过传播、重试退避、超时结算、中断恢复 |
 | `workflow/state.go` | `Store` 接口、错误定义、状态深拷贝 |
-| `workflow/memstore.go` | 内存持久化（互斥锁，用于并发触发测试） |
-| `workflow/filestore.go` | JSON 文件持久化（`flock` + 原子 rename，用于重启恢复） |
+| `workflow/runlock.go` | 跨进程归属认领抽象（`ClaimStore` / `RunClaim`） |
+| `workflow/report.go` | 运行结果视图（`RunReport`）：终态、每任务状态、每次尝试的结果与依据 |
+| `workflow/memstore.go` | 内存持久化 + 进程内归属认领（用于并发触发测试） |
+| `workflow/filestore.go` | JSON 文件持久化 + per-run `flock` 归属锁（用于多进程与重启恢复） |
 | `workflow/log.go` / `clock.go` | 决策日志与可替换时间源 |
 
 ## 定义工作流
@@ -130,20 +135,77 @@ PENDING/READY（任一上游非成功终态）───────────�
   每个任务在任一时刻最多只有一个在飞尝试（`inflight` 表 + attempt 代际）。
 - 不同 `runID` 拥有完全独立的调度循环、状态与执行 goroutine。
 
+## 多进程（多 worker）行为约定
+
+多个进程可以共用同一个 `FileStore` 状态目录并发工作，协调只靠文件系统能力，
+不引入任何外部服务：
+
+- **归属认领**：调度一个运行前，引擎先通过 `ClaimStore.TryClaimRun` 对
+  `<runID>.runlock` 文件加 `flock(LOCK_EX|LOCK_NB)`。
+  任一时刻同一 `runID` 至多一个进程持有归属权并真正调度；
+  未抢到锁的进程记录 `CLAIM_DENIED` 决策，**只读不调度**——
+  其 `Trigger` 返回既有快照，`RunAndWait` 转为轮询持久化状态直到终态，
+  因此所有进程拿到的结论完全一致。
+- **接手（failover）**：持有进程被强杀（SIGKILL/崩溃）时，内核自动释放其文件锁。
+  其他 worker 通过后台巡检（`WithClaimInterval(d)`）发现仍处 `RUNNING` 且无人持有的运行，
+  认领后从磁盘状态恢复调度。**接手延迟上界 ≈ 一个巡检周期**（锁在进程死亡瞬间即释放）。
+  锁文件内另写有 owner/PID/心跳信息（`FileStore.ClaimInfo` 可读），仅供观察排查，
+  归属判定只以文件锁为准。
+- **已知边界**：归属判定依赖内核文件锁，因此覆盖“进程死亡”场景；
+  进程仅被暂停（SIGSTOP）而未死亡时锁仍被持有，不会被接管——这属于有意取舍，
+  避免暂停后苏醒的进程与接手者产生双主。
+- **运行间隔离**：认领与调度都以 `runID` 为单位，某进程里卡住的运行
+  不影响其他进程推进其他运行（见 `TestCrossProcRunIsolation`）。
+- 未实现 `ClaimStore` 的 Store（或纯单进程用法）行为与之前完全一致。
+
+```go
+// 每个 worker 进程：
+store, _ := workflow.NewFileStore("/shared/state/dir")
+eng := workflow.NewEngine(store, executor, logger,
+    workflow.WithClaimInterval(500*time.Millisecond), // 巡检并接手无人负责的 RUNNING 运行
+)
+eng.Register(def)
+eng.Trigger(ctx, "wf", runID)        // 幂等；归属权唯一
+status, _ := eng.RunAndWait(ctx, runID) // 非归属方自动转为轮询等待同一终态
+```
+
 ## 中断恢复
 
 - 发起尝试前先把任务持久化为 `RUNNING`（含 `Attempt` 与开始时间），
   再启动执行；因此崩溃后磁盘上的 `RUNNING` 表示“结果未知的在飞尝试”，
   **绝不会被判定为成功**。
-- 新引擎对同一 `runID` 调用 `Trigger` 时会命中既有运行并启动恢复调度：
+- 新引擎对同一 `runID` 调用 `Trigger`（或巡检认领）时会命中既有运行并启动恢复调度：
   - `SUCCEEDED` / `PERMANENTLY_FAILED` / `SKIPPED`：原样保留，成功任务不再执行；
-  - `RUNNING`：记录 `RECOVER_RUNNING` 决策后重置为 `READY` 重新调度。
+  - `RUNNING`：记录 `RECOVER_RUNNING` 决策后重置为 `READY` 重新调度，
+    并补记一条 `INTERRUPTED` 尝试记录。
     该中断尝试已发起，计入尝试次数；若它本就是末次尝试，则直接收敛为
     `PERMANENTLY_FAILED`（崩溃可能发生在“末次失败已落盘、终态未落盘”的窗口）；
   - `FAILED` / `TIMED_OUT`：崩溃发生在退避窗口，按剩余额度决定重试或收敛终态。
-- `FileStore` 用目录级 `flock` 串行化跨进程读写，每次写入走临时文件 + 原子 rename。
+- 恢复语义对“同进程重启”和“跨进程接手”完全一致：两者都从同一份持久化状态出发，
+  走同一条 `recoverInterrupted` 路径，因此重复触发多少次，最终收敛的终态都相同。
+- `FileStore` 用目录级 `flock` 串行化跨进程读写，每次写入走临时文件 + 原子 rename，
+  读到的永远是迁移前或迁移后的完整快照，不会读到半截状态。
 - 引擎 `Close()` 会取消所有在飞尝试的 ctx、停止退避计时器并等待调度循环退出；
   已写入的状态保持一致，由下次启动恢复。
+
+## 结果视图（RunReport）
+
+运行结束后（以及运行期间）可通过 `Engine.Report(ctx, runID)` 读取完整执行结果视图：
+
+- 运行终态、创建/更新时间；
+- 每个任务的最终状态、已发起尝试次数、末次错误；
+- **每一次尝试的记录**（`AttemptRecord`）：尝试序号、收尾方式
+  （`SUCCEEDED` / `FAILED` / `TIMED_OUT` / `INTERRUPTED` / `SKIPPED`）、
+  判定依据（错误内容、超时阈值、跳过原因、中断说明）与起止时间；
+- 整个运行的累计尝试次数 `TotalAttempts`。
+
+一致性约定：
+
+- 视图由 `Store` 的一致性快照构造，多进程并发读取时内容一致；
+  运行期间读取只会看到单调推进的状态（尝试计数只增不减），不会读到半截写入；
+- 运行进入终态后视图不再变化，任意进程、任意次数重复读取结果完全相同
+  （任务按名称排序，输出可复现）；
+- 同一运行对任何进程可见：非归属进程与归属进程读到的是同一份持久化状态。
 
 ## 决策日志（可解释性）
 
@@ -155,9 +217,9 @@ decision=ATTEMPT_FAILED run=r task=flaky attempt=2 第 2 次尝试失败；结�
 decision=RETRY_SCHEDULED run=r task=flaky attempt=2 仍有重试额度（2/3），50ms 后重试
 ```
 
-决策种类包括：`TRIGGERED`、`ALREADY_RUNNING`、`RECOVER_RUNNING`、`LAUNCH_ATTEMPT`、
-`BLOCKED`、`ATTEMPT_SUCCEEDED`、`ATTEMPT_FAILED`、`ATTEMPT_TIMEOUT`、
-`RETRY_SCHEDULED`、`RETRIES_EXHAUSTED`、`SKIP`、`RUN_SUCCEEDED`、`RUN_FAILED`。
+决策种类包括：`TRIGGERED`、`ALREADY_RUNNING`、`CLAIM_ACQUIRED`、`CLAIM_DENIED`、
+`RECOVER_RUNNING`、`LAUNCH_ATTEMPT`、`BLOCKED`、`ATTEMPT_SUCCEEDED`、`ATTEMPT_FAILED`、
+`ATTEMPT_TIMEOUT`、`RETRY_SCHEDULED`、`RETRIES_EXHAUSTED`、`SKIP`、`RUN_SUCCEEDED`、`RUN_FAILED`。
 每条日志都包含 run、任务、尝试序号与结果依据；测试在 `-v` 下打印完整决策流。
 
 ## 本地验证方法
@@ -189,3 +251,31 @@ go run ./cmd/demo
 | `TestIndependentRunsIsolated` | 独立 run 互不影响 |
 | `TestRecoveryAfterCrash` | 重启后成功任务不重跑、中断任务不算成功、重调度后收敛 |
 | `TestRecoveryExhaustedDuringCrash` | 崩溃于终态落盘窗口时恢复到确定终态且不补跑 |
+| `TestReportViewCompleteAndStable` | 结果视图：终态/每任务状态/总尝试数/逐次尝试依据，终态后重复读取一致 |
+| `TestMultiEngineSameDirSingleOwner` | 同目录双引擎并发触发：归属唯一、任务恰执行一次、双方视图一致 |
+| `TestCrossProcConcurrentTrigger` | 3 个真实进程并发触发同一运行：认领恰好一次、每任务恰执行一次、运行期间视图自洽、跨进程报告逐字节一致 |
+| `TestCrossProcKillAndTakeover` | 持有进程被 SIGKILL 后另一进程接手：成功任务不重跑、中断尝试计次不计成功、无重复结果、终态确定 |
+
+## 多进程复现与验证
+
+```bash
+# 跨进程测试（真实子进程：并发触发、强杀接手、结果一致性），竞态检测下多轮
+go test ./workflow/ -race -run 'TestCrossProc|TestMultiEngine' -count=10 -v
+
+# 手工复现：两个终端共用同一状态目录
+# 终端 1（worker A，任务会卡住）：
+go run ./cmd/worker -dir /tmp/wfstate -run demo-1 -behavior hang &
+# 终端 2：强杀 A 后启动 worker B，B 在一个巡检周期内接手并把运行跑完
+kill -9 %1
+go run ./cmd/worker -dir /tmp/wfstate -run demo-1 -behavior ok
+# 任意进程查看结果视图：
+go run ./cmd/worker -dir /tmp/wfstate -run demo-1 -report
+```
+
+## 兼容性说明
+
+- **单进程用法不变**：`NewEngine(store, exec, logger)` 不加任何新选项时行为与之前一致
+  （无后台巡检 goroutine）；`WithClaimInterval` 仅在多进程部署时需要。
+- **已有状态数据可直接使用**：旧版 JSON 状态文件缺少 `records` 字段时按空切片处理，
+  任务/运行状态机与持久化格式未变；`.runlock` 锁文件为新增文件，不影响旧数据。
+- `MemoryStore` 同样实现了归属认领接口，进程内多引擎测试语义与文件实现对齐。

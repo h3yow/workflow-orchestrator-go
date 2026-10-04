@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 // FileStore 将每次运行以一个 JSON 文件落盘，配合 flock 互斥锁，
@@ -210,3 +212,109 @@ func (s *FileStore) ListRuns(ctx context.Context, workflowName string) ([]*RunSt
 
 // Close 释放资源。
 func (s *FileStore) Close() error { return nil }
+
+// claimHeartbeatInterval 是归属锁文件中心跳信息的刷新周期。
+// 心跳仅供观察（ClaimInfo），归属判定只依赖内核文件锁本身。
+const claimHeartbeatInterval = 500 * time.Millisecond
+
+// claimInfo 是 .runlock 文件中记录的所有者信息。
+type claimInfo struct {
+	Owner      string    `json:"owner"`
+	PID        int       `json:"pid"`
+	AcquiredAt time.Time `json:"acquired_at"`
+	Heartbeat  time.Time `json:"heartbeat"`
+}
+
+// fileClaim 是基于 per-run 文件锁的跨进程归属权。
+// 锁在整个持有期间保持；持有进程被强杀时内核自动释放，
+// 其他进程的 TryClaimRun 随后即可成功，实现接手。
+type fileClaim struct {
+	f     *os.File
+	owner string
+	done  chan struct{}
+	wg    sync.WaitGroup
+}
+
+// TryClaimRun 以 LOCK_EX|LOCK_NB 尝试认领 runID 的调度归属权。
+// 同一 runID 的锁文件在任一时刻至多被一个进程持有（含跨进程）。
+func (s *FileStore) TryClaimRun(ctx context.Context, runID, owner string) (RunClaim, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	path := filepath.Join(s.dir, sanitize(runID)+".runlock")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err != nil {
+		f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, nil // 其他进程持有，本进程只读不调度
+		}
+		return nil, err
+	}
+	c := &fileClaim{f: f, owner: owner, done: make(chan struct{})}
+	c.writeHeartbeat()
+	c.wg.Add(1)
+	go c.heartbeatLoop()
+	return c, nil
+}
+
+func (c *fileClaim) Owner() string { return c.owner }
+
+// writeHeartbeat 就地覆写锁文件内容。不能走临时文件 + rename：
+// 锁绑定在 inode 上，替换文件会让新打开者拿到未加锁的 inode。
+func (c *fileClaim) writeHeartbeat() {
+	info := claimInfo{Owner: c.owner, PID: os.Getpid(), Heartbeat: timeNow()}
+	if b, err := json.Marshal(info); err == nil {
+		_, _ = c.f.WriteAt(b, 0)
+		_ = c.f.Truncate(int64(len(b)))
+	}
+}
+
+func (c *fileClaim) heartbeatLoop() {
+	defer c.wg.Done()
+	t := time.NewTicker(claimHeartbeatInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			c.writeHeartbeat()
+		case <-c.done:
+			return
+		}
+	}
+}
+
+// Release 停止心跳并释放文件锁。
+func (c *fileClaim) Release() error {
+	select {
+	case <-c.done:
+	default:
+		close(c.done)
+	}
+	c.wg.Wait()
+	syscall.Flock(int(c.f.Fd()), syscall.LOCK_UN)
+	return c.f.Close()
+}
+
+// ClaimInfo 读取 runID 归属锁文件中的所有者信息，仅供观察与运维排查。
+// 无人持有或内容暂不可读时返回 (nil, nil)。
+func (s *FileStore) ClaimInfo(runID string) (*claimInfo, error) {
+	b, err := os.ReadFile(filepath.Join(s.dir, sanitize(runID)+".runlock"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var info claimInfo
+	if err := json.Unmarshal(b, &info); err != nil {
+		return nil, nil // 心跳覆写窗口内的半截内容，按无信息处理
+	}
+	return &info, nil
+}

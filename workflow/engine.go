@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 )
@@ -15,6 +16,10 @@ type Engine struct {
 	executor Executor
 	logger   Logger
 	nowFunc  func() time.Time
+
+	ownerID       string
+	claimInterval time.Duration // >0 时后台巡检并认领无人负责的 RUNNING 运行
+	pollInterval  time.Duration // 非归属方等待终态的轮询间隔
 
 	mu       sync.Mutex
 	registry map[string]*dag
@@ -29,7 +34,10 @@ type Engine struct {
 type Option func(*engineConfig)
 
 type engineConfig struct {
-	nowFunc func() time.Time
+	nowFunc       func() time.Time
+	ownerID       string
+	claimInterval time.Duration
+	pollInterval  time.Duration
 }
 
 // WithClock 注入自定义时间源（主要用于测试）。
@@ -37,24 +45,63 @@ func WithClock(f func() time.Time) Option {
 	return func(c *engineConfig) { c.nowFunc = f }
 }
 
+// WithOwnerID 设置本进程作为运行归属方的标识（用于日志与锁文件心跳）。
+// 缺省为 主机名-PID-随机后缀。
+func WithOwnerID(id string) Option {
+	return func(c *engineConfig) { c.ownerID = id }
+}
+
+// WithClaimInterval 开启后台巡检：每隔 d 扫描一次仍处于 RUNNING 且
+// 无人持有的运行并尝试认领接手。多进程部署时各 worker 都应开启；
+// 接手延迟上界约为一个巡检周期（持有进程死亡即释放文件锁）。
+func WithClaimInterval(d time.Duration) Option {
+	return func(c *engineConfig) { c.claimInterval = d }
+}
+
+// WithPollInterval 设置非归属方在 RunAndWait 中轮询终态的间隔（缺省 50ms）。
+func WithPollInterval(d time.Duration) Option {
+	return func(c *engineConfig) { c.pollInterval = d }
+}
+
 // NewEngine 创建编排引擎。
 func NewEngine(store Store, executor Executor, logger Logger, opts ...Option) *Engine {
-	cfg := &engineConfig{nowFunc: timeNow}
+	cfg := &engineConfig{
+		nowFunc:      timeNow,
+		ownerID:      defaultOwnerID(),
+		pollInterval: 50 * time.Millisecond,
+	}
 	for _, o := range opts {
 		o(cfg)
 	}
 	if logger == nil {
 		logger = nopLogger{}
 	}
-	return &Engine{
-		store:    store,
-		executor: executor,
-		logger:   logger,
-		nowFunc:  cfg.nowFunc,
-		registry: make(map[string]*dag),
-		active:   make(map[string]*runLoop),
-		stopped:  make(chan struct{}),
+	e := &Engine{
+		store:         store,
+		executor:      executor,
+		logger:        logger,
+		nowFunc:       cfg.nowFunc,
+		ownerID:       cfg.ownerID,
+		claimInterval: cfg.claimInterval,
+		pollInterval:  cfg.pollInterval,
+		registry:      make(map[string]*dag),
+		active:        make(map[string]*runLoop),
+		stopped:       make(chan struct{}),
 	}
+	if cfg.claimInterval > 0 {
+		e.wg.Add(1)
+		go e.claimLoop()
+	}
+	return e
+}
+
+// defaultOwnerID 生成进程级归属标识。
+func defaultOwnerID() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown"
+	}
+	return fmt.Sprintf("%s-%d-%d", host, os.Getpid(), time.Now().UnixNano())
 }
 
 // Register 加载并注册一份工作流定义；校验失败时返回可区分的错误。
@@ -140,12 +187,9 @@ func (e *Engine) RunAndWait(ctx context.Context, runID string) (RunStatus, error
 		return "", err
 	}
 	if loop == nil {
-		// 并发窗口中被其他调用者收尾，回读终态。
-		final, gerr := e.store.GetRun(context.Background(), runID)
-		if gerr != nil {
-			return "", gerr
-		}
-		return final.Status, nil
+		// 不归本进程调度：要么刚刚被其他调用者收尾，要么归属权在别的进程。
+		// 轮询状态直到终态，保证调用方拿到与其他进程一致的结论。
+		return e.waitTerminal(ctx, runID)
 	}
 	select {
 	case <-loop.done:
@@ -162,6 +206,71 @@ func (e *Engine) RunAndWait(ctx context.Context, runID string) (RunStatus, error
 		return "", err
 	}
 	return final.Status, nil
+}
+
+// waitTerminal 轮询运行状态直到终态或 ctx 取消。
+// 用于归属权在其他进程时的等待方：读到的是同一份持久化状态，
+// 因此结论与执行方完全一致。
+func (e *Engine) waitTerminal(ctx context.Context, runID string) (RunStatus, error) {
+	t := time.NewTicker(e.pollInterval)
+	defer t.Stop()
+	for {
+		snap, err := e.store.GetRun(ctx, runID)
+		if err != nil {
+			return "", err
+		}
+		if snap.Status != RunRunning {
+			return snap.Status, nil
+		}
+		select {
+		case <-t.C:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+}
+
+// claimLoop 周期性认领无人负责的 RUNNING 运行（多进程接手入口）。
+func (e *Engine) claimLoop() {
+	defer e.wg.Done()
+	t := time.NewTicker(e.claimInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			e.claimPendingRuns()
+		case <-e.stopped:
+			return
+		}
+	}
+}
+
+// claimPendingRuns 扫描所有运行，对仍处 RUNNING 且本进程未在调度的运行
+// 尝试认领归属权；认领成功即启动（恢复）调度循环。
+func (e *Engine) claimPendingRuns() {
+	runs, err := e.store.ListRuns(context.Background(), "")
+	if err != nil {
+		e.logger.Logf("claim scan: list runs: %v", err)
+		return
+	}
+	for _, r := range runs {
+		if r.Status != RunRunning {
+			continue
+		}
+		e.mu.Lock()
+		_, active := e.active[r.RunID]
+		e.mu.Unlock()
+		if active {
+			continue
+		}
+		d, err := e.lookupWorkflow(r.WorkflowName)
+		if err != nil {
+			continue // 本进程未注册该工作流，不参与认领
+		}
+		if _, err := e.ensureScheduled(d, r); err != nil {
+			e.logger.Logf("claim scan: schedule run %s: %v", r.RunID, err)
+		}
+	}
 }
 
 // Close 停止引擎，等待在飞调度收尾（在飞尝试的结果仍会被持久化）。

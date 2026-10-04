@@ -62,5 +62,15 @@ func snapshotTask(t *TaskState) *TaskState {
 		v := *t.LastEndedAt
 		cp.LastEndedAt = &v
 	}
+	if t.Records != nil {
+		cp.Records = make([]AttemptRecord, len(t.Records))
+		copy(cp.Records, t.Records)
+		for i := range cp.Records {
+			if t.Records[i].StartedAt != nil {
+				v := *t.Records[i].StartedAt
+				cp.Records[i].StartedAt = &v
+			}
+		}
+	}
 	return &cp
 }

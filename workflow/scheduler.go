@@ -79,6 +79,12 @@ func (e *Engine) ensureScheduled(d *dag, runID string) (*runLoop, error) {
 	default:
 	}
 
+	// 抢运行租约前必须先持有本进程的存活凭证，
+	// 否则本进程暂停/卡顿时会被其他进程误判为已死而抢走任务。
+	if err := e.ensurePresence(); err != nil {
+		return nil, fmt.Errorf("hold process presence: %w", err)
+	}
+
 	// 租约获取不持有引擎锁，避免目录锁等待阻塞其他运行的调度。
 	acquired, snap, err := e.store.AcquireRunLease(context.Background(), runID, e.owner, e.leaseTTL)
 	if err != nil {
@@ -86,11 +92,23 @@ func (e *Engine) ensureScheduled(d *dag, runID string) (*runLoop, error) {
 	}
 	if !acquired {
 		holder := "unknown"
+		expired := true
 		if snap.Lease != nil {
 			holder = snap.Lease.Owner
+			expired = snap.Lease.expired(e.nowFunc())
 		}
-		e.logger.LogDecision(Decision{At: e.nowFunc(), RunID: runID, Kind: DecisionLeaseHeldByOther,
-			Detail: fmt.Sprintf("租约由 %s 持有，本进程只读结果、等待其收尾或掉线", holder)})
+		if expired && snap.Lease != nil {
+			// 心跳已超时但抢不到租约：持有者的存活凭证仍在，
+			// 说明它只是暂时没响应（暂停/卡顿），绝不能接管。
+			if e.noteStallWait(runID) {
+				e.logger.LogDecision(Decision{At: e.nowFunc(), RunID: runID, Kind: DecisionHolderUnresponsive,
+					Detail: fmt.Sprintf("持有者 %s 心跳已超时但进程确认仍存活（存活锁未释放），"+
+						"宁可等待也不接管，避免任务被重复执行", holder)})
+			}
+		} else {
+			e.logger.LogDecision(Decision{At: e.nowFunc(), RunID: runID, Kind: DecisionLeaseHeldByOther,
+				Detail: fmt.Sprintf("租约由 %s 持有（TTL 内），本进程只读结果、等待其收尾或掉线", holder)})
+		}
 		return nil, nil
 	}
 	if snap.Status != RunRunning {
@@ -237,6 +255,16 @@ func (l *runLoop) armHeartbeat() {
 func (l *runLoop) renewLease() {
 	if l.leaseLost {
 		return
+	}
+	// 测试钩子：闸门关闭（无人发送）时心跳在此停摆，
+	// 等价于整个进程被暂停，租约会因 TTL 到期而“心跳超时”，
+	// 但引擎本身与存活锁仍然存活，接管方必须能识别并拒绝接管。
+	if gate := l.engine.heartbeatGate; gate != nil {
+		select {
+		case <-gate:
+		case <-l.engine.stopped:
+			return
+		}
 	}
 	ok, err := l.engine.store.RenewRunLease(context.Background(), l.runID, l.owner, l.token, l.engine.leaseTTL)
 	if err != nil {

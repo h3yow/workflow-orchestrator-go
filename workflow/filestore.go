@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -57,6 +58,119 @@ func (s *FileStore) lock() (*fileLock, error) {
 func (l *fileLock) unlock() {
 	syscall.Flock(int(l.f.Fd()), syscall.LOCK_UN)
 	l.f.Close()
+}
+
+// presenceDir 存放每个引擎进程的存活锁文件：一个 owner 一个文件，
+// 文件上持有独占 flock 即代表该进程还活着。
+func (s *FileStore) presenceDir() string { return filepath.Join(s.dir, ".owners") }
+
+func (s *FileStore) presencePath(owner string) string {
+	return filepath.Join(s.presenceDir(), sanitize(owner)+".lock")
+}
+
+// filePresence 是一个被独占 flock 持有的存活锁文件句柄。
+type filePresence struct {
+	f *os.File
+}
+
+func (p *filePresence) Release() error {
+	if p == nil || p.f == nil {
+		return nil
+	}
+	err1 := syscall.Flock(int(p.f.Fd()), syscall.LOCK_UN)
+	err2 := p.f.Close()
+	p.f = nil
+	if err1 != nil {
+		return err1
+	}
+	return err2
+}
+
+// HoldPresence 创建/打开 owner 的存活锁文件并以阻塞方式取得独占 flock。
+// 锁随返回的 Presence 持有，直到 Release 或进程退出（含 kill -9）由内核释放。
+// 取得自己的锁后，尽力清理目录里“无人持有的陈旧锁文件”：
+// 能被 LOCK_NB 抢到即证明对应进程已退出（或从未运行完启动），删除安全；
+// 抢不到说明对方仍存活，绝不动它的文件。清理失败不影响持有本身。
+func (s *FileStore) HoldPresence(ctx context.Context, owner string) (Presence, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(s.presenceDir(), 0o755); err != nil {
+		return nil, fmt.Errorf("create presence dir: %w", err)
+	}
+	f, err := os.OpenFile(s.presencePath(owner), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, err
+	}
+	p := &filePresence{f: f}
+	s.sweepStalePresence(owner)
+	return p, nil
+}
+
+// sweepStalePresence 删除其他 owner 无人持有的陈旧存活锁文件。
+// 仅在调用方已持有自己的存活锁后调用；任何 I/O 错误都忽略（尽力而为）。
+func (s *FileStore) sweepStalePresence(self string) {
+	entries, err := os.ReadDir(s.presenceDir())
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".lock") {
+			continue
+		}
+		if name := strings.TrimSuffix(e.Name(), ".lock"); name == sanitize(self) {
+			continue
+		}
+		path := filepath.Join(s.presenceDir(), e.Name())
+		old, err := os.OpenFile(path, os.O_RDWR, 0o644)
+		if err != nil {
+			continue
+		}
+		if err := syscall.Flock(int(old.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			// EWOULDBLOCK：对应进程仍存活，保留其锁文件；其他错误同样保守跳过。
+			_ = old.Close()
+			continue
+		}
+		// 抢到锁：无人持有，删除后立即释放。
+		_ = os.Remove(path)
+		_ = syscall.Flock(int(old.Fd()), syscall.LOCK_UN)
+		_ = old.Close()
+	}
+}
+
+// OwnerAlive 非阻塞地探测 owner 的存活锁：
+// 抢得到（LOCK_NB）说明无人持有 -> owner 已退出（或从未注册），返回 false；
+// EWOULDBLOCK 说明锁被持有 -> owner 进程还活着（暂停也仍持有），返回 true。
+// 存活锁文件（或 .owners 目录）尚不存在时，说明该 owner 从未在本目录注册过，
+// 同样视为不存活（典型于手工构造的遗留状态或旧版本数据）。
+func (s *FileStore) OwnerAlive(ctx context.Context, owner string) (alive bool, err error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	f, err := os.OpenFile(s.presencePath(owner), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	defer func() {
+		// 关闭本描述即释放本次试探性加的锁。
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}()
+	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err == nil {
+		return false, nil
+	}
+	if errors.Is(err, syscall.EWOULDBLOCK) {
+		return true, nil
+	}
+	return false, err
 }
 
 func (s *FileStore) readLocked(runID string) (*RunState, error) {
@@ -195,7 +309,11 @@ func (s *FileStore) AcquireRunLease(ctx context.Context, runID, owner string, tt
 	if err != nil {
 		return false, nil, err
 	}
-	if !acquireLease(r, owner, ttl, timeNow()) {
+	now := timeNow()
+	holderAlive := func(holder string) (bool, error) {
+		return s.OwnerAlive(context.Background(), holder)
+	}
+	if !acquireLease(r, owner, ttl, now, holderAlive) {
 		return false, snapshotRun(r), nil
 	}
 	if err := s.writeLocked(r); err != nil {

@@ -12,13 +12,53 @@ import (
 // 并以同一互斥锁实现租约获取/续期/释放与 fencing 校验的原子性。
 // 适用于单进程多引擎（或测试）场景；跨进程请使用 FileStore。
 type MemoryStore struct {
-	mu   sync.Mutex
-	runs map[string]*RunState
+	mu      sync.Mutex
+	runs    map[string]*RunState
+	present map[string]int // 持有存活凭证的 owner -> 引用计数
 }
 
 // NewMemoryStore 创建内存存储。
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{runs: make(map[string]*RunState)}
+	return &MemoryStore{runs: make(map[string]*RunState), present: make(map[string]int)}
+}
+
+// memPresence 是内存版存活凭证，仅用于单进程内模拟：
+// 持有期间 owner 出现在注册表中，Release（引擎 Close）即注销。
+type memPresence struct {
+	s     *MemoryStore
+	owner string
+}
+
+func (p *memPresence) Release() error {
+	p.s.mu.Lock()
+	defer p.s.mu.Unlock()
+	if n := p.s.present[p.owner]; n > 1 {
+		p.s.present[p.owner] = n - 1
+	} else {
+		delete(p.s.present, p.owner)
+	}
+	return nil
+}
+
+// HoldPresence 内存版：把 owner 登记为存活，直到凭证 Release。
+func (s *MemoryStore) HoldPresence(ctx context.Context, owner string) (Presence, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	s.present[owner]++
+	s.mu.Unlock()
+	return &memPresence{s: s, owner: owner}, nil
+}
+
+// OwnerAlive 内存版：owner 登记在册即视为存活。
+func (s *MemoryStore) OwnerAlive(ctx context.Context, owner string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.present[owner] > 0, nil
 }
 
 // CreateRunIfNotExists 原子地创建运行；相同 runID 的并发调用只有一个生效。
@@ -78,7 +118,9 @@ func (s *MemoryStore) AcquireRunLease(ctx context.Context, runID, owner string, 
 	if !ok {
 		return false, nil, ErrRunNotFound
 	}
-	if !acquireLease(r, owner, ttl, timeNow()) {
+	// 调用方已持有 s.mu，直接查注册表判断持有者是否仍存活。
+	holderAlive := func(holder string) (bool, error) { return s.present[holder] > 0, nil }
+	if !acquireLease(r, owner, ttl, timeNow(), holderAlive) {
 		return false, snapshotRun(r), nil
 	}
 	return true, snapshotRun(r), nil

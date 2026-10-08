@@ -18,8 +18,24 @@ var ErrWorkflowNotRegistered = errors.New("workflow not registered")
 //   - 同一运行任一时刻至多一个持有者拥有有效租约；
 //   - 租约的获取/续期/释放与 fenced 写入都是“读-改-写”原子的
 //     （内存实现用互斥锁，文件实现用 flock），
-//     且 fencing token 单调递增、绝不复用。
+//     且 fencing token 单调递增、绝不复用；
+//   - HoldPresence 以“进程生命周期”为粒度持有存活凭证，
+//     进程被强杀时由操作系统自动释放（FileStore 用内核级 flock），
+//     从而让接管方区分“还活着只是暂时没响应”与“进程已彻底退出”。
 type Store interface {
+	// HoldPresence 以 owner 名义持有一份“进程存活凭证”。
+	// 引擎在生命周期内（启动到 Close）始终持有它；同一进程可重复调用，
+	// 返回的 Presence 在 Close（或进程退出）前持续有效。
+	// FileStore 的实现是一个被独占 flock 锁住的文件：进程只是暂停/卡顿
+	// （如 SIGSTOP、GC、机器抖动）时锁依然在；进程被 kill -9 后由内核释放。
+	HoldPresence(ctx context.Context, owner string) (Presence, error)
+	// OwnerAlive 非阻塞地探测 owner 是否仍然持有存活凭证：
+	//   - alive=true：owner 进程确认还活着（哪怕它的租约心跳已超时），
+	//     调用方绝不可接管其运行；
+	//   - alive=false：owner 凭证无人持有（进程已退出，或从未注册），
+	//     租约心跳又已超时的运行允许接管；
+	//   - err 非 nil：探测本身不可用，调用方按“无法确认死亡”处理，继续等待。
+	OwnerAlive(ctx context.Context, owner string) (alive bool, err error)
 	// CreateRunIfNotExists 原子地创建运行；已存在时返回 existed=true。
 	CreateRunIfNotExists(ctx context.Context, state *RunState) (existed bool, err error)
 	// GetRun 读取一次运行的完整状态快照（深拷贝）。

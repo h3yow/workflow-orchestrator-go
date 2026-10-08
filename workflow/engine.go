@@ -12,9 +12,10 @@ import (
 // 推进依赖、处理重试/超时，并把所有状态迁移持久化到 Store。
 //
 // 多进程协调：多个进程（各自一个 Engine）指向同一个 Store 时，
-// 同一运行任一时刻只有一个进程持有租约并负责推进；
-// 持有者通过心跳续租，掉线后租约到期，其他进程即可接管。
-// 所有状态写入都携带 fencing token，掉线进程的迟到写入会被拒绝。
+// 同一运行任一时刻只有一个进程持有租约并负责推进；持有者通过心跳续租。
+// 心跳超时不会直接导致接管：接管方还须通过进程存活锁确认持有进程已彻底退出
+// （暂停/卡顿但仍存活的进程不会被抢走任务）。所有状态写入都携带 fencing token，
+// 掉线进程的迟到写入会被拒绝。
 type Engine struct {
 	store    Store
 	executor Executor
@@ -29,6 +30,22 @@ type Engine struct {
 	registry map[string]*dag
 	active   map[string]*runLoop
 	wg       sync.WaitGroup
+
+	// presence 为本进程（本引擎）的存活凭证，首个运行调度前惰性获取，
+	// 随引擎存活一直持有，Close 时释放；其他进程据此判断本进程是否还活着。
+	presenceOnce sync.Once
+	presence     Presence
+	presenceErr  error
+
+	// stallWarn 记录每个 run 上次打印“持有者存活但心跳超时、继续等待”
+	// 决策的时刻，避免轮询等待期间日志刷屏。
+	stallWarnMu sync.Mutex
+	stallWarn   map[string]time.Time
+
+	// heartbeatGate 仅用于测试：非 nil 时每次心跳计时器触发后都会先尝试
+	// 从此通道接收（被阻塞即等价于整个进程被 SIGSTOP/调度饿死：
+	// 心跳停摆、租约 TTL 到期，但引擎 goroutine 与存活锁都还在）。
+	heartbeatGate chan struct{}
 
 	stopOnce sync.Once
 	stopped  chan struct{}
@@ -49,8 +66,10 @@ func WithClock(f func() time.Time) Option {
 	return func(c *engineConfig) { c.nowFunc = f }
 }
 
-// WithLeaseTTL 设置运行租约时长：持有者心跳中断超过该时长即被视为掉线，
-// 其他进程可接管。心跳间隔为 TTL/3。默认 DefaultLeaseTTL。
+// WithLeaseTTL 设置租约“心跳超时”时长：持有者超过该时长没有续上心跳，
+// 仅被视为“暂时失联”；接管方还会通过进程存活锁确认其已彻底退出才真正接管，
+// 因此进程还活着（暂停/卡顿）时任务不会被重跑。心跳间隔为 TTL/3。
+// 默认 DefaultLeaseTTL。
 func WithLeaseTTL(d time.Duration) Option {
 	return func(c *engineConfig) {
 		if d > 0 {
@@ -93,8 +112,32 @@ func NewEngine(store Store, executor Executor, logger Logger, opts ...Option) *E
 		pollInterval: cfg.pollInterval,
 		registry:     make(map[string]*dag),
 		active:       make(map[string]*runLoop),
+		stallWarn:    make(map[string]time.Time),
 		stopped:      make(chan struct{}),
 	}
+}
+
+// ensurePresence 惰性获取本进程的存活凭证；任何要去抢运行租约之前
+// 都必须先持有它，这样本进程日后即使暂停/卡顿，其他进程也能确认“它还活着”。
+func (e *Engine) ensurePresence() error {
+	e.presenceOnce.Do(func() {
+		e.presence, e.presenceErr = e.store.HoldPresence(context.Background(), e.owner)
+	})
+	return e.presenceErr
+}
+
+// noteStallWait 对“持有者存活但心跳超时”的等待日志按 TTL 节流：
+// 每个 run 至多每隔一个 TTL 打印一条，返回是否本次应当打印。
+func (e *Engine) noteStallWait(runID string) bool {
+	now := e.nowFunc()
+	e.stallWarnMu.Lock()
+	defer e.stallWarnMu.Unlock()
+	last, ok := e.stallWarn[runID]
+	if ok && now.Sub(last) < e.leaseTTL {
+		return false
+	}
+	e.stallWarn[runID] = now
+	return true
 }
 
 // Register 加载并注册一份工作流定义；校验失败时返回可区分的错误。
@@ -165,7 +208,8 @@ func (e *Engine) Trigger(ctx context.Context, workflowName, runID string) (*RunS
 
 // RunAndWait 调度（若尚未调度且租约可用）并阻塞直到运行进入终态或 ctx 取消。
 // 若运行由其他进程持有，本进程只轮询状态库等待其收尾；
-// 持有者掉线（租约过期）后，本进程会自动接管并继续推进。
+// 只有在持有者心跳超时且进程存活锁确认其已退出后，本进程才会接管并继续推进；
+// 持有者只是暂停/卡顿但仍存活时，本进程一直等待，不会重跑它手上的任务。
 func (e *Engine) RunAndWait(ctx context.Context, runID string) (RunStatus, error) {
 	for {
 		snap, err := e.store.GetRun(ctx, runID)
@@ -225,10 +269,14 @@ func (e *Engine) Result(ctx context.Context, runID string) (*RunState, error) {
 }
 
 // Close 停止引擎：取消所有在飞尝试、停止退避与心跳计时器、
-// 释放持有的租约（其他进程可立即接管），并等待调度循环退出。
+// 释放持有的租约（其他进程可立即接管），等待调度循环退出，
+// 最后释放本进程的存活凭证（向外界宣告本进程不再负责任何运行）。
 func (e *Engine) Close() error {
 	e.stopOnce.Do(func() { close(e.stopped) })
 	e.wg.Wait()
+	if e.presence != nil {
+		return e.presence.Release()
+	}
 	return nil
 }
 

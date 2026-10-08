@@ -78,7 +78,16 @@ func (s *MemoryStore) AcquireRunLease(ctx context.Context, runID, owner string, 
 	if !ok {
 		return false, nil, ErrRunNotFound
 	}
-	if !acquireLease(r, owner, ttl, timeNow()) {
+	now := timeNow()
+	if gate, deadOwner := acquireGate(r, owner, now); gate == gateProbe {
+		memRegistryMu.Lock()
+		_, alive := memRegistry[deadOwner]
+		memRegistryMu.Unlock()
+		if alive {
+			return false, snapshotRun(r), nil
+		}
+	}
+	if !acquireLease(r, owner, ttl, now) {
 		return false, snapshotRun(r), nil
 	}
 	return true, snapshotRun(r), nil

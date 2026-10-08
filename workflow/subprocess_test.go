@@ -38,12 +38,23 @@ func appendExecLog(dir, line string) {
 // TestHelperProcess 不是普通测试：它是被 TestTakeoverAfterSIGKILL 以
 // 子进程方式启动的“worker 进程”。通过环境变量启用，正常 go test 时直接返回。
 // 子进程触发运行后阻塞在 block 任务里，等待父进程 SIGKILL。
+//
+// WF_HELPER_MODE=freeze 时用于 TestTakeoverBlockedWhileOwnerFrozen：
+// block 任务在“第 1 次尝试在飞”后打印 HELPER_FROZEN，随后自我阻塞；
+// 父进程随即 SIGSTOP 整个进程（心跳一并停止），验证其他进程不会接管，
+// 之后 SIGKILL，由第二进程接管——同一任务绝不执行两遍。
+//
+// WF_HELPER_MODE=recover 时用于 TestOwnerRecoversAfterFreeze：
+// block 打印 HELPER_FROZEN 后等待 recover.flag 文件出现（模拟卡顿恢复），
+// 随后由原进程自己成功返回并退出；父进程在其冻结期间 SIGSTOP/SIGCONT，
+// 验证恢复后是原进程把任务跑完，第二进程一次都没执行。
 func TestHelperProcess(t *testing.T) {
 	if os.Getenv("WF_HELPER") != "1" {
 		return
 	}
 	dir := os.Getenv("WF_DIR")
 	runID := os.Getenv("WF_RUN")
+	mode := os.Getenv("WF_HELPER_MODE")
 	st, err := NewFileStore(dir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -55,6 +66,25 @@ func TestHelperProcess(t *testing.T) {
 			return AttemptResult{}
 		},
 		"block": func(ctx context.Context, runID, name string, attemptNo int) AttemptResult {
+			switch mode {
+			case "freeze":
+				// 告知父进程“第 1 次尝试已在飞”，之后永久阻塞，
+				// 由父进程 SIGSTOP 暂停整个进程（含心跳 goroutine）。
+				fmt.Println("HELPER_FROZEN")
+				select {}
+			case "recover":
+				// 在飞后告知父进程，随后等待外部“恢复信号文件”，模拟短暂卡顿后恢复，
+				// 由原进程自己完成这唯一一次尝试。
+				fmt.Println("HELPER_FROZEN")
+				recoverFlag := filepath.Join(dir, "recover.flag")
+				for {
+					if _, err := os.Stat(recoverFlag); err == nil {
+						appendExecLog(dir, "block")
+						return AttemptResult{}
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
 			// 告知父进程“第 1 次尝试已在飞”，随后永久阻塞（不响应取消），
 			// 模拟真实世界里卡在外部调用上的任务。
 			fmt.Println("HELPER_BLOCK_STARTED")
@@ -69,7 +99,16 @@ func TestHelperProcess(t *testing.T) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
-	select {} // 等待被 SIGKILL
+	if mode == "recover" {
+		// 恢复模式：等运行被原进程自己跑完后正常退出，并向父进程发出结束信号。
+		if _, err := eng.RunAndWait(context.Background(), runID); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		fmt.Println("HELPER_DONE")
+		return
+	}
+	select {} // 等待被 SIGKILL / SIGSTOP
 }
 
 // TestTakeoverAfterSIGKILL 端到端验证：一个真实进程在任务在飞时被 kill -9，

@@ -17,6 +17,12 @@ import (
 // flock 作用于独立的打开文件描述，因此这些实例之间的互斥与真实跨进程一致。
 func newProc(t *testing.T, dir string, exec Executor, ttl time.Duration) *Engine {
 	t.Helper()
+	return newProcWithLogger(t, dir, exec, ttl, NewLogger(io.Discard))
+}
+
+// newProcWithLogger 与 newProc 相同，但允许注入决策日志器。
+func newProcWithLogger(t *testing.T, dir string, exec Executor, ttl time.Duration, logger Logger) *Engine {
+	t.Helper()
 	st, err := NewFileStore(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -24,7 +30,7 @@ func newProc(t *testing.T, dir string, exec Executor, ttl time.Duration) *Engine
 	if ttl <= 0 {
 		ttl = 400 * time.Millisecond
 	}
-	eng := NewEngine(st, exec, NewLogger(io.Discard),
+	eng := NewEngine(st, exec, logger,
 		WithLeaseTTL(ttl), WithPollInterval(15*time.Millisecond))
 	t.Cleanup(func() { _ = eng.Close() })
 	return eng

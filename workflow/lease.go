@@ -11,7 +11,9 @@ import (
 // 跨进程协调的默认时间参数。
 const (
 	// DefaultLeaseTTL 是运行租约的默认存活时长：持有方心跳中断超过该时长，
-	// 即被视为掉线，其他进程可接管。详见 README「多进程协调」。
+	// 租约即到期。注意“租约到期”并不直接等于掉线——接管还要求存活锁确认
+	// 持有进程已彻底退出（见 liveness.go / fileliveness.go 与 README
+	// 「多进程协调」），因此进程暂停/卡顿时不会被误接管。
 	DefaultLeaseTTL = 2 * time.Second
 	// leaseRenewDivisor 决定心跳间隔 = TTL / leaseRenewDivisor。
 	leaseRenewDivisor = 3

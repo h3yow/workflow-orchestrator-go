@@ -50,6 +50,31 @@ type Store interface {
 	Close() error
 }
 
+// OwnerHold 是一个进程级的“存活锁”句柄：持有期间该 owner 被视为存活，
+// 其他进程不得接管其租约到期的运行；Release（或进程彻底退出导致锁被
+// 内核自动回收）后，其他进程才能确认该 owner 已不会再回来并接管。
+type OwnerHold interface {
+	// Release 主动放弃存活锁（引擎优雅关闭时调用）。
+	Release() error
+}
+
+// LivenessStore 是 Store 的可选扩展：提供“进程是否真的还活着”的判定，
+// 用于区分“持有进程只是暂时没响应（仍存活，禁止接管）”与
+// “持有进程已彻底退出（可以接管）”。内置的 MemoryStore/FileStore 均实现。
+// 未实现该接口的自定义 Store 退化为仅按租约 TTL 判定（旧行为）。
+type LivenessStore interface {
+	// HoldOwner 为 owner 持有一把进程级排他存活锁，直到 Release 或进程退出。
+	// 同一 owner 重入返回同一份句柄；锁被同名存活者占用时返回错误。
+	HoldOwner(ctx context.Context, owner string) (OwnerHold, error)
+	// ProbeOwner 探测 owner 进程是否仍然存活：
+	// alive=true 表示存活锁仍被持有（进程还活着，哪怕暂时没响应），
+	// alive=false 表示锁已无人持有（进程已彻底退出，不会再产生迟到写入）。
+	ProbeOwner(ctx context.Context, owner string) (alive bool, err error)
+}
+
+// ErrOwnerLockHeld 表示存活锁已被同名的存活 owner 占用。
+var ErrOwnerLockHeld = errors.New("owner liveness lock already held")
+
 // snapshotRun 返回运行状态的深拷贝。
 func snapshotRun(r *RunState) *RunState {
 	if r == nil {

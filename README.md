@@ -9,8 +9,10 @@
   任务执行在独立 goroutine 中，但结果通过事件队列回到调度循环结算。
 - 每次尝试带**代际（attempt 序号）校验**：过期结果（超时先收尾后迟到的返回、
   被中断的尝试）一律丢弃，保证同一次尝试只产生一次状态写入。
-- 跨进程协调靠**文件锁 + 租约（lease）+ fencing token**：任一时刻只有一个进程
-  负责推进某次运行；持有者心跳续租，掉线后租约到期由其他进程接管；
+- 跨进程协调靠**文件锁 + 租约（lease）+ fencing token + 进程存活锁**：
+  任一时刻只有一个进程负责推进某次运行；持有者心跳续租；**心跳暂停不等于
+  进程死亡**——只有“租约到期”且“进程级存活锁确认旧持有者已彻底退出”两个条件
+  同时成立，其他进程才会接管，因此进程被挂起/卡顿时绝不会发生任务重跑；
   掉线进程的迟到写入被 fencing token 拒绝，绝不会覆盖新持有者的状态。
 - 状态持久化抽象为 `Store` 接口，提供内存实现与 JSON 文件实现（`flock` 跨进程互斥）。
 
@@ -30,6 +32,9 @@ go test ./... -race -v   # 全量测试（竞态检测 + 决策日志）
 | `workflow/engine.go` | 引擎入口：注册、触发（去重）、等待、结果视图、关闭 |
 | `workflow/scheduler.go` | 串行调度循环：依赖推进、跳过传播、重试退避、超时结算、租约心跳、中断恢复 |
 | `workflow/lease.go` | 租约类型与获取/续期/释放/fencing 判定（两种 Store 共用） |
+| `workflow/liveness.go` | 接管门控的纯判定：区分“租约未到期 / 到期但 owner 待探测存活” |
+| `workflow/fileliveness.go` | FileStore 的进程存活锁（`.owners/` 下的非阻塞 `flock`） |
+| `workflow/memliveness.go` | MemoryStore 的存活登记（单进程/测试用，含模拟进程退出钩子） |
 | `workflow/result.go` | 结果视图：尝试结算记录（`AttemptRecord`）与汇总辅助 |
 | `workflow/state.go` | `Store` 接口（含租约与 fencing 写入）、错误定义、状态深拷贝 |
 | `workflow/memstore.go` | 内存持久化（互斥锁，用于单进程/测试） |
@@ -135,7 +140,7 @@ PENDING/READY（任一上游非成功终态）───────────�
   每个任务在任一时刻最多只有一个在飞尝试（`inflight` 表 + attempt 代际）。
 - 不同 `runID` 拥有完全独立的调度循环、状态与执行 goroutine。
 
-## 多进程协调（租约 + fencing token）
+## 多进程协调（租约 + fencing token + 进程存活锁）
 
 多个 worker 进程可以指向**同一个状态目录**（各自 `NewFileStore(同一目录)` + `NewEngine`），
 引擎仅靠文件锁与本地状态文件完成协调，不需要任何外部服务：
@@ -145,31 +150,58 @@ PENDING/READY（任一上游非成功终态）───────────�
   `Store.AcquireRunLease` 原子地拿到租约；拿不到（被其他存活进程持有）时，
   本次触发只读既有结果（记录 `LEASE_HELD_BY_OTHER` 决策），`RunAndWait`
   转为轮询等待，绝不重复调度。
-- **心跳与掉线判定**：持有者每 `TTL/3` 续一次租约。TTL 默认 `2s`
-  （`WithLeaseTTL` 可调），即**一个进程约 2 秒没有任何心跳即被视为掉线**，
-  租约到期后任何进程都可接管。优雅 `Close()` 会主动释放租约，接管立即发生，
-  无需等待 TTL。
+- **心跳与“多久算失联”**：持有者每 `TTL/3` 续一次租约。TTL 默认 `2s`
+  （`WithLeaseTTL` 可调）。**注意：心跳暂停本身并不触发接管**——
+  机器卡顿、进程被 `SIGSTOP` 暂停、GC/调度忙不过来等情况下，进程可能在
+  `TTL` 甚至更长时间里没有任何心跳，但它其实还活着；仅凭心跳超时就接管会把
+  它手上在飞的任务重跑一遍（旧实现的缺陷）。是否真的可以接管，由下面的
+  进程存活锁最终裁决。
+- **进程存活锁（区分“暂时没响应”与“彻底退出”）**：每个引擎在首次调度前，
+  会在状态目录的 `.owners/` 子目录持有一把以自己 owner 标识命名的**非阻塞排他
+  `flock`**，直到引擎优雅关闭或进程退出。其他进程想接管一个“租约已到期”的
+  运行时，会先去抢这把存活锁：
+  - 抢不到（锁仍被持有）：说明持有进程**还活着**，哪怕它暂停了心跳、暂时毫无
+    响应，也**绝不接管**，只继续只读等待（记录 `OWNER_ALIVE_UNRESPONSIVE`
+    决策）。此时运行可能暂时停住，但不会出现重复执行——这是有意的取舍：
+    **宁可等，也不跑两遍**。
+  - 抢到了（锁无人持有）：持有进程已经**彻底退出**（被 `kill -9`、崩溃、
+    机器掉电或正常 `Close()`），锁被内核自动回收，这时才允许接管。
+
+  也就是说接管的充要条件是：**租约到期 + 存活锁可获取（旧持有者确认死亡）**。
+  优雅 `Close()` 会先释放运行租约、最后释放存活锁，因此正常停机时接管几乎
+  立即发生；被 `kill -9` 时接管发生在“约一个 TTL + 一次探测”之后（默认约 2s）。
+- **暂停但不退出会一直等吗？** 会。如果持有进程既不退出也不恢复（例如被人
+  长期 `SIGSTOP`、或宿主机彻底卡死但未掉电），其他进程会一直等待而不是重跑。
+  需要人工介入（恢复它或杀掉它）。这正是“同一任务任何时候只能有一个进程真正
+  负责执行、绝不能跑两遍”的直接代价。
 - **fencing token**：租约每次易主 token 单调递增（`RunState.LastToken` 只增不减）。
   所有任务/运行状态写入都携带持有者的 token，存储层在校验不匹配时拒绝写入——
   被强杀或失联进程的迟到写入**绝不会**覆盖新持有者的状态，
   因此不可能出现两份互相打架的结果。
-- **接管语义**：接管方恢复调度时——已 `SUCCEEDED` 的任务不再执行；
+- **接管语义**：只有满足上述两个条件（租约到期 + 存活锁确认旧持有者已退出），
+  接管方才会恢复调度。恢复时——已 `SUCCEEDED` 的任务不再执行；
   中断时在飞的尝试（磁盘上的 `RUNNING`）不判定为成功，记一条 `INTERRUPTED`
-  结算（占用一次尝试额度）后重新调度；额度已耗尽的直接收敛到
-  `PERMANENTLY_FAILED`，不补跑。整个运行最终收敛到确定终态，
-  重复触发多少次拿到的结论都一样。
-- **运行间隔离**：租约是运行级的，某个运行卡住或失败不会拖住其他运行；
-  目录级文件锁只在单次读-改-写期间持有，执行期间不持锁。
+  结算（**该尝试已发起过，占用一次尝试额度**，但其结果绝不复用）后重新调度；
+  额度已耗尽的直接收敛到 `PERMANENTLY_FAILED`，不补跑。接管后的重新执行只会
+  产生一份结果，整个运行最终收敛到确定、可复现的终态，重复触发多少次拿到的
+  结论都一样。
+- **运行间隔离**：租约与存活锁都是运行/进程级的，某个运行卡住或失败不会拖住
+  其他运行；目录级文件锁只在单次读-改-写期间持有，执行期间不持锁。
+- **状态目录布局**：`<state-dir>/<runID>.json` 为各运行状态文件，
+  `<state-dir>/.lock` 为串行化读-改-写的目录锁，
+  `<state-dir>/.owners/<owner>.lock` 为每个进程的存活锁文件
+  （文件本身保留不删，仅靠其上的 `flock` 判定存活；`.owners/` 会在需要时
+  自动创建）。
 
 多进程用法与单进程完全一致（同一套 API），只是多个进程打开同一目录：
 
 ```go
 st, _ := workflow.NewFileStore("/shared/state/dir")   // 每个进程各开一份
 eng := workflow.NewEngine(st, executor, logger,
-    workflow.WithLeaseTTL(2*time.Second))             // 掉线判定时长
+    workflow.WithLeaseTTL(2*time.Second))             // 租约时长（心跳暂停多久算“到期”）
 eng.Register(def)
 snap, existed, _ := eng.Trigger(ctx, "demo", "run-42") // existed=true 表示已存在
-status, _ := eng.RunAndWait(ctx, "run-42")             // 不归自己管时会等对方收尾或掉线接管
+status, _ := eng.RunAndWait(ctx, "run-42")             // 不归自己管时等待；持有者退出且租约到期才接管
 view, _ := eng.Result(ctx, "run-42")                   // 任意进程可读完整结果视图
 ```
 
@@ -200,19 +232,33 @@ view, _ := eng.Result(ctx, "run-42")                   // 任意进程可读完�
     `PERMANENTLY_FAILED`（崩溃可能发生在“末次失败已落盘、终态未落盘”的窗口）；
   - `FAILED` / `TIMED_OUT`：崩溃发生在退避窗口，按剩余额度决定重试或收敛终态。
 - `FileStore` 用目录级 `flock` 串行化跨进程读写，每次写入走临时文件 + 原子 rename。
-- 引擎 `Close()` 会取消所有在飞尝试的 ctx、停止退避与心跳计时器、释放租约，
-  并等待调度循环退出；已写入的状态保持一致，由下次启动（或接管进程）恢复。
-  被 `kill -9` 的进程没机会做这些清理：租约随 TTL 到期失效后由其他进程接管，
+- 引擎 `Close()` 会取消所有在飞尝试的 ctx、停止退避与心跳计时器、先释放租约、
+  最后释放存活锁，并等待调度循环退出；已写入的状态保持一致，由下次启动
+  （或接管进程）恢复。
+  被 `kill -9` 的进程没机会做这些清理：运行租约随 TTL 到期失效、进程存活锁被
+  内核自动回收，其他进程在“租约到期 + 存活锁可获取”后接管（默认约 2s 内），
   其迟到写入被 fencing token 拒绝（见 `TestTakeoverAfterSIGKILL`）。
+  反过来，进程若只是被 `SIGSTOP` 暂停或机器卡顿（没退出），存活锁仍在，
+  其他进程即使等过多个 TTL 也不会接管（见 `TestOwnerRecoversAfterFreeze` 与
+  `TestTakeoverBlockedWhileOwnerFrozen`）。
 
 ## 兼容性
 
 - **单进程用法不变**：API 与之前完全相同（`Register`/`Trigger`/`RunAndWait`/`Close`），
-  租约的获取、续期、释放全部由引擎内部完成，调用方无感知；
-  `MemoryStore` 同样实现了租约语义，单进程多引擎行为一致。
+  租约的获取/续期/释放以及存活锁的持有/探测全部由引擎内部完成，调用方无感知；
+  `MemoryStore` 同样实现了租约与存活语义，单进程多引擎行为一致。
 - **已有状态数据可直接使用**：旧版本落盘的 JSON 没有 `Lease`/`LastToken`/
   `Attempts` 字段，加载后分别为 `nil`/`0`/空序列——`nil` 租约即“无人持有”，
-  新引擎首次触发即可正常获取租约并恢复调度，无需任何迁移。
+  新引擎首次触发即可正常获取租约并恢复调度，无需任何迁移。`.owners/`
+  目录会在首次需要时自动创建，旧目录无需改造。
+- **新老进程混跑说明**：接管判定中的存活锁是**更安全的附加条件**，仅由
+  “执行接管的一方”使用。接管一个运行时若查不到旧持有者的存活锁文件，
+  会把旧持有者视为已退出（等价于旧版本进程或已被回收的进程），仍按
+  “租约到期即可接管”的旧规则处理；新版本引擎之间则享受完整的
+  “暂停不接管”保护。建议同一状态目录下的 worker 统一升级，以获得完整保证。
+- **文件系统要求**：存活锁依赖本地文件系统的 `flock(2)`（与既有目录锁相同）。
+  绝大多数本地磁盘/ext4/tmpfs 均支持；不支持 `flock` 的网络文件系统（如部分
+  NFS 配置）不适合作为多进程共享状态目录——这与既有跨进程互斥的前提一致。
 - **时间源**：`WithClock` 注入的时间源只影响业务时间戳；
   租约计时始终使用真实墙钟（跨进程可比），不受注入时钟影响。
 
@@ -227,6 +273,7 @@ decision=RETRY_SCHEDULED run=r task=flaky attempt=2 仍有重试额度（2/3）�
 ```
 
 决策种类包括：`TRIGGERED`、`ALREADY_RUNNING`、`LEASE_ACQUIRED`、`LEASE_HELD_BY_OTHER`、
+`OWNER_ALIVE_UNRESPONSIVE`（租约已到期但存活探测确认持有进程仍存活，拒绝接管）、
 `LEASE_LOST`、`RECOVER_RUNNING`、`LAUNCH_ATTEMPT`、`BLOCKED`、`ATTEMPT_SUCCEEDED`、
 `ATTEMPT_FAILED`、`ATTEMPT_TIMEOUT`、`RETRY_SCHEDULED`、`RETRIES_EXHAUSTED`、`SKIP`、
 `RUN_SUCCEEDED`、`RUN_FAILED`。
@@ -253,12 +300,21 @@ go run ./cmd/demo
 - **单进程内模拟多进程**：`workflow/multiprocess_test.go` 在同一状态目录上创建多组
   独立的 `FileStore` + `Engine`。`flock` 作用于独立的打开文件描述，
   因此这些实例之间的互斥语义与真实多进程一致。
+- **存活但无响应（暂停）后恢复**：`TestOwnerRecoversAfterFreeze` 用 `os/exec`
+  启动真实 worker，等任务在飞后对整个进程发 `SIGSTOP`（心跳一并冻结、租约到期），
+  持续验证第二进程在多个 TTL 内只输出 `OWNER_ALIVE_UNRESPONSIVE` 而**不重跑**；
+  再 `SIGCONT` 恢复，由原进程自己把任务跑完，第二进程零执行、终态确定。
+  `TestTakeoverBlockedWhileOwnerFrozen` 覆盖同一暂停窗口、最后改为强杀的路径。
 - **真实子进程 + kill -9**：`TestTakeoverAfterSIGKILL` 用 `os/exec` 启动一个
-  真实 worker 进程，等它的任务在飞后发送 SIGKILL，再由本进程接管跑完，
-  并跨进程校验执行次数（共享日志文件）与结果视图。
-- **手工复现**：也可以自己起两个进程指向同一目录——一个跑 `Trigger` 后 `kill -9`，
-  另一个对同一 `runID` 调用 `Trigger` + `RunAndWait`，约一个租约 TTL（默认 2s）
-  后即可观察到接管与 `RECOVER_RUNNING` 决策。
+  真实 worker 进程，等它的任务在飞后发送 SIGKILL，再由本进程在
+  “租约到期 + 存活锁可获取”后接管跑完，并跨进程校验执行次数（共享日志文件）
+  与结果视图。
+- **手工复现**：也可以自己起两个进程指向同一目录——
+  - 暂停：对持有方 `kill -STOP <pid>`，观察另一进程在约一个 TTL 后开始打印
+    `OWNER_ALIVE_UNRESPONSIVE` 但不执行任务；`kill -CONT <pid>` 后由原进程收尾。
+  - 强杀：持有方跑 `Trigger` 后 `kill -9 <pid>`，另一个对同一 `runID` 调用
+    `Trigger` + `RunAndWait`，约一个租约 TTL（默认 2s）后观察到接管与
+    `RECOVER_RUNNING` 决策。
 
 测试与需求点的对应：
 
@@ -278,4 +334,7 @@ go run ./cmd/demo
 | `TestFencedWritesRejected` | fencing token：易主后旧持有者的写入/续期/释放全部失效（内存与文件两种 Store） |
 | `TestResultViewCompleteAndConsistent` | 结果视图完整（终态/任务状态/尝试次数/逐次结算依据）、并发读取只见完整快照、多次读取一致 |
 | `TestMultiProcessRunsIsolated` | 某运行被他进程卡住时，其他运行照常推进 |
+| `TestOwnerLivenessGate` | 存活锁门控：租约到期但 owner 仍存活时拒绝接管；owner 退出后接管且 token 递增（内存/文件两种 Store） |
+| `TestTakeoverBlockedWhileOwnerFrozen` | 真实进程 SIGSTOP 暂停（心跳停、租约到期）期间多轮尝试接管全部被挡、零重跑；之后强杀才接管一次 |
+| `TestOwnerRecoversAfterFreeze` | 真实进程暂停后恢复：由原进程自己把在飞任务跑完，第二进程全程零执行、终态确定 |
 | `TestTakeoverAfterSIGKILL` | 真实子进程被 kill -9 后跨进程接管：成功任务不重跑、中断占额度、收敛到确定终态 |

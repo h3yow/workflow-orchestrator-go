@@ -18,6 +18,8 @@ import (
 type FileStore struct {
 	dir string
 	mu  sync.Mutex // 进程内串行化，配合文件锁覆盖跨进程并发
+	// ownerHolds 记录本 FileStore 持有的进程级存活锁句柄。
+	ownerHolds map[string]*fileOwnerHold
 }
 
 // NewFileStore 打开（必要时创建）状态目录。
@@ -25,7 +27,7 @@ func NewFileStore(dir string) (*FileStore, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create state dir: %w", err)
 	}
-	return &FileStore{dir: dir}, nil
+	return &FileStore{dir: dir, ownerHolds: make(map[string]*fileOwnerHold)}, nil
 }
 
 func (s *FileStore) path(runID string) string {
@@ -195,7 +197,22 @@ func (s *FileStore) AcquireRunLease(ctx context.Context, runID, owner string, tt
 	if err != nil {
 		return false, nil, err
 	}
-	if !acquireLease(r, owner, ttl, timeNow()) {
+	now := timeNow()
+	switch gate, deadOwner := acquireGate(r, owner, now); gate {
+	case gateHeld:
+		return false, snapshotRun(r), nil
+	case gateProbe:
+		// 旧持有者心跳已停（租约到期），但接管前必须确认其进程已彻底退出：
+		// 存活锁仍被持有时拒绝接管，哪怕它暂时没有任何响应。
+		alive, perr := s.probeOwnerLocked(deadOwner)
+		if perr != nil {
+			return false, nil, perr
+		}
+		if alive {
+			return false, snapshotRun(r), nil
+		}
+	}
+	if !acquireLease(r, owner, ttl, now) {
 		return false, snapshotRun(r), nil
 	}
 	if err := s.writeLocked(r); err != nil {

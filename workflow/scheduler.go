@@ -79,6 +79,11 @@ func (e *Engine) ensureScheduled(d *dag, runID string) (*runLoop, error) {
 	default:
 	}
 
+	// 持有本进程存活锁：心跳暂停不等于死亡，其他进程凭存活锁区分两种情况。
+	if err := e.ensureOwnerHold(); err != nil {
+		return nil, err
+	}
+
 	// 租约获取不持有引擎锁，避免目录锁等待阻塞其他运行的调度。
 	acquired, snap, err := e.store.AcquireRunLease(context.Background(), runID, e.owner, e.leaseTTL)
 	if err != nil {
@@ -86,11 +91,33 @@ func (e *Engine) ensureScheduled(d *dag, runID string) (*runLoop, error) {
 	}
 	if !acquired {
 		holder := "unknown"
+		expiredButAlive := false
 		if snap.Lease != nil {
 			holder = snap.Lease.Owner
+			expiredButAlive = snap.Lease.expired(e.nowFunc())
 		}
-		e.logger.LogDecision(Decision{At: e.nowFunc(), RunID: runID, Kind: DecisionLeaseHeldByOther,
-			Detail: fmt.Sprintf("租约由 %s 持有，本进程只读结果、等待其收尾或掉线", holder)})
+		// 轮询会高频重试获取；同一运行的等待决策按一个 TTL 限频，避免刷屏。
+		e.mu.Lock()
+		last, seen := e.waitLogged[runID]
+		now := e.nowFunc()
+		shouldLog := !seen || now.Sub(last) >= e.leaseTTL
+		if shouldLog {
+			e.waitLogged[runID] = now
+		}
+		e.mu.Unlock()
+		if shouldLog {
+			detail := fmt.Sprintf("租约由 %s 持有（心跳正常），本进程只读结果、等待其收尾或彻底退出", holder)
+			kind := DecisionLeaseHeldByOther
+			if expiredButAlive {
+				// 租约已到期仍拿不到：存活锁确认旧持有者进程还活着（只是暂停/卡顿），
+				// 按语义宁可等待也绝不接管重跑。
+				kind = DecisionOwnerAliveUnresponsive
+				detail = fmt.Sprintf("租约已到期（%s 超过 %s 未续期），但存活探测确认持有进程 %s 仍然存活"+
+					"（暂停/卡顿、暂时无响应）；宁可等待也不接管，杜绝同一任务跑两遍",
+					holder, e.leaseTTL, holder)
+			}
+			e.logger.LogDecision(Decision{At: now, RunID: runID, Kind: kind, Detail: detail})
+		}
 		return nil, nil
 	}
 	if snap.Status != RunRunning {

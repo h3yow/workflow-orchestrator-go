@@ -28,7 +28,13 @@ type Engine struct {
 	mu       sync.Mutex
 	registry map[string]*dag
 	active   map[string]*runLoop
-	wg       sync.WaitGroup
+	// waitLogged 记录“等待他人/存活但无响应”决策的最近一次输出时刻，用于限频。
+	waitLogged map[string]time.Time
+	wg         sync.WaitGroup
+
+	// ownerHold 为本进程的存活锁；仅当 Store 实现 LivenessStore 时非 nil。
+	// 持有期间其他进程不得接管本进程租约到期的运行。
+	ownerHold OwnerHold
 
 	stopOnce sync.Once
 	stopped  chan struct{}
@@ -49,8 +55,10 @@ func WithClock(f func() time.Time) Option {
 	return func(c *engineConfig) { c.nowFunc = f }
 }
 
-// WithLeaseTTL 设置运行租约时长：持有者心跳中断超过该时长即被视为掉线，
-// 其他进程可接管。心跳间隔为 TTL/3。默认 DefaultLeaseTTL。
+// WithLeaseTTL 设置运行租约时长：持有者心跳中断超过该时长后租约到期。
+// 到期后并不会立即被接管——其他进程还会通过进程存活锁确认持有者已彻底退出；
+// 若持有者只是暂停/卡顿（仍存活），则继续等待而不是重跑。心跳间隔为 TTL/3。
+// 默认 DefaultLeaseTTL。
 func WithLeaseTTL(d time.Duration) Option {
 	return func(c *engineConfig) {
 		if d > 0 {
@@ -71,6 +79,10 @@ func WithPollInterval(d time.Duration) Option {
 
 // NewEngine 创建编排引擎。每个引擎实例拥有进程级唯一的 owner 标识，
 // 用于租约归属与 fencing。
+//
+// 若 Store 实现了 LivenessStore（内置实现均实现），引擎会在首次调度前
+// 惰性持有一把进程级“存活锁”：持有期间即使心跳暂时中断，其他进程也不能
+// 接管本进程在跑的运行（见 README「多进程协调」）。
 func NewEngine(store Store, executor Executor, logger Logger, opts ...Option) *Engine {
 	cfg := &engineConfig{
 		nowFunc:      timeNow,
@@ -93,8 +105,30 @@ func NewEngine(store Store, executor Executor, logger Logger, opts ...Option) *E
 		pollInterval: cfg.pollInterval,
 		registry:     make(map[string]*dag),
 		active:       make(map[string]*runLoop),
+		waitLogged:   make(map[string]time.Time),
 		stopped:      make(chan struct{}),
 	}
+}
+
+// ensureOwnerHold 惰性持有本进程的存活锁（仅一次）。
+// 不实现 LivenessStore 的 Store 跳过：退化为仅按租约 TTL 判定的旧行为。
+func (e *Engine) ensureOwnerHold() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.ownerHold != nil {
+		return nil
+	}
+	ls, ok := e.store.(LivenessStore)
+	if !ok {
+		return nil
+	}
+	h, err := ls.HoldOwner(context.Background(), e.owner)
+	if err != nil {
+		return fmt.Errorf("hold owner liveness lock: %w", err)
+	}
+	e.ownerHold = h
+	e.logger.Logf("进程存活锁已持有 owner=%s：存活期间即使心跳暂停，其他进程也不会接管", e.owner)
+	return nil
 }
 
 // Register 加载并注册一份工作流定义；校验失败时返回可区分的错误。
@@ -225,11 +259,22 @@ func (e *Engine) Result(ctx context.Context, runID string) (*RunState, error) {
 }
 
 // Close 停止引擎：取消所有在飞尝试、停止退避与心跳计时器、
-// 释放持有的租约（其他进程可立即接管），并等待调度循环退出。
+// 释放持有的租约（其他进程可立即接管），等待调度循环退出后，
+// 最后释放进程级存活锁（此后其他进程的存活探测才会判定本进程已退出）。
 func (e *Engine) Close() error {
 	e.stopOnce.Do(func() { close(e.stopped) })
 	e.wg.Wait()
-	return nil
+	var closeErr error
+	e.mu.Lock()
+	h := e.ownerHold
+	e.ownerHold = nil
+	e.mu.Unlock()
+	if h != nil {
+		// 存活锁最后释放：先让租约落盘为无人持有，再宣告本进程退出，
+		// 保证观察到“存活锁消失”的进程一定能读到释放后的租约。
+		closeErr = h.Release()
+	}
+	return closeErr
 }
 
 // initialTaskStates 为 DAG 中每个任务创建唯一归属的初始实例。
